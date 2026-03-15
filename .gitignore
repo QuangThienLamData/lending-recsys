@@ -1,0 +1,43 @@
+# ── Data (never commit raw or processed data) ─────────────────────────────────
+data/raw/
+data/processed/
+
+# ── Trained artefacts (too large for git) ─────────────────────────────────────
+models/saved/
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# ── Environments ─────────────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Secrets ───────────────────────────────────────────────────────────────────
+.env
+*.env
+kaggle.json
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Evaluation output ─────────────────────────────────────────────────────────
+evaluation/results.json
+evaluation/ablation_results.csv

@@ -1,0 +1,51 @@
+# docker-compose.yml
+# ---------------------------------------------------------------------------
+# Starts the FastAPI recommendation server.
+# Pre-trained artefacts are mounted from ./models/saved/ so you can retrain
+# locally and restart the container without rebuilding the image.
+#
+# Commands:
+#   docker compose up --build        # first-time build + start
+#   docker compose up -d             # detached
+#   docker compose logs -f           # follow logs
+#   docker compose down              # stop
+# ---------------------------------------------------------------------------
+
+services:
+
+  recommender-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: credit-recommender
+    image: credit-recommender:latest
+
+    ports:
+      - "8000:8000"
+
+    # Mount pre-trained artefacts as read-only so the container always uses
+    # the latest checkpoint without a rebuild.
+    volumes:
+      - ./models/saved:/app/models/saved:ro
+      - ./data/processed:/app/data/processed:ro
+
+    environment:
+      # Paths (must match volume mount targets above)
+      MODEL_DIR:          /app/models/saved
+      FAISS_INDEX_PATH:   /app/models/saved/faiss.index
+      RANKING_MODEL_PATH: /app/models/saved/ranking_model.pt
+      ENCODERS_PATH:      /app/models/saved/encoders.pkl
+
+      # Optional LLM reranker — set in a .env file or CI secrets, never hardcode
+      # LLM_PROVIDER:     openai          # or "anthropic"
+      # OPENAI_API_KEY:   ${OPENAI_API_KEY}
+      # ANTHROPIC_API_KEY:${ANTHROPIC_API_KEY}
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+    restart: unless-stopped
