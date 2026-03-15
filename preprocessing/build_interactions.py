@@ -19,6 +19,7 @@ import pandas as pd
 import numpy as np
 import scipy.sparse as sp
 from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
 import pickle
 
 # --------------------------------------------------------------------------- #
@@ -137,6 +138,19 @@ def main(raw_path: str = RAW_CSV):
 
     df = load_raw(raw_path)
     df = clean(df)
+
+    # --- ADDED: 7% Stratified Sampling ---
+    print(f"[build_interactions] Performing 7% stratified sampling on 'grade'...")
+    # We use stratify=df['grade'] to ensure the risk distribution stays the same
+    df, _ = train_test_split(
+        df, 
+        train_size=0.07, 
+        stratify=df['grade'], 
+        random_state=42
+    )
+    print(f"  Sampled size: {len(df):,} rows")
+    # -------------------------------------
+    
     df, user_enc, item_enc = encode_ids(df)
 
     n_users = len(user_enc.classes_)

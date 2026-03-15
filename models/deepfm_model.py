@@ -139,7 +139,7 @@ class DeepFM(nn.Module):
         deep_out = self.deep_output(self.deep(deep_in)).squeeze(-1)  # (B,)
 
         # ── Output ──────────────────────────────────────────────────────
-        return self.sigmoid(fm_out + deep_out)  # (B,)
+        return fm_out + deep_out  # (B,)
 
 
 # ── Convenience factory ─────────────────────────────────────────────────────

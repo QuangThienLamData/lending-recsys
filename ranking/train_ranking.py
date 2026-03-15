@@ -147,11 +147,11 @@ def train(
     print(f"  Model: {model_type}  trainable params: {total_params:,}")
 
     # ── Optimiser & Loss ────────────────────────────────────────────────
-    criterion  = nn.BCELoss()
+    criterion = nn.BCEWithLogitsLoss()
     optimiser  = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler  = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimiser, mode="max", factor=0.5, patience=2, verbose=True)
-
+        optimiser, mode="max", factor=0.5, patience=2)
+    scaler = torch.amp.GradScaler('cuda')
     best_ndcg   = 0.0
     patience_ctr = 0
 
@@ -169,24 +169,28 @@ def train(
             if uf is not None:  uf  = uf.to(device)
             if itf is not None: itf = itf.to(device)
 
-            if model_type == "neumf":
-                preds = model(user_idx, item_idx, uf, itf)
-            else:
-                # DeepFM: build sparse_inputs tensor [user_idx, item_idx]
-                sparse_in  = torch.stack([user_idx, item_idx], dim=1)
-                dense_in   = None
-                if uf is not None and itf is not None:
-                    dense_in = torch.cat([uf, itf], dim=-1)
-                elif uf is not None:
-                    dense_in = uf
-                elif itf is not None:
-                    dense_in = itf
-                preds = model(sparse_in, dense_in)
+            with torch.amp.autocast('cuda'):
+                if model_type == "neumf":
+                    preds = model(user_idx, item_idx, uf, itf)
+                else:
+                    # DeepFM: build sparse_inputs tensor [user_idx, item_idx]
+                    sparse_in  = torch.stack([user_idx, item_idx], dim=1)
+                    dense_in   = None
+                    if uf is not None and itf is not None:
+                        dense_in = torch.cat([uf, itf], dim=-1)
+                    elif uf is not None:
+                        dense_in = uf
+                    elif itf is not None:
+                        dense_in = itf
+                    preds = model(sparse_in, dense_in)
 
-            loss = criterion(preds, labels)
-            optimiser.zero_grad()
-            loss.backward()
-            optimiser.step()
+                loss = criterion(preds, labels)
+
+            # Use the scaler to compute gradients and update weights
+            scaler.scale(loss).backward()
+            scaler.step(optimiser)
+            scaler.update()
+
             total_loss += loss.item() * len(labels)
 
         avg_loss = total_loss / len(train_ds)
