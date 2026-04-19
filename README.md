@@ -1,130 +1,111 @@
-# Fintech Credit Product Recommendation System
+# Lending RecSys — Credit Product Recommendation System
 
 An end-to-end, multi-stage ML recommendation pipeline for financial credit products,
-built on the LendingClub dataset. The system combines collaborative filtering,
-deep feature-interaction ranking, and zero-shot LLM re-ranking to recommend
-loan products that are both relevant to the borrower and aligned with credit risk principles.
+built on the LendingClub dataset. The system combines approval prediction, collaborative
+filtering, deep-feature-interaction ranking, and LLM re-ranking into a unified
+**Streamlit web application** for both borrowers and internal staff.
 
-**Stack:** Python · PyTorch · FAISS · DeepFM · Gemini API · FastAPI · Docker
+**Stack:** Python · XGBoost · ALS · FAISS · DeepFM · OpenAI / Anthropic · Streamlit
 
 ---
 
 ## Problem Statement
 
-Recommending financial products is fundamentally different from recommending movies
-or e-commerce items. Two challenges make it uniquely hard:
+This system is designed to solve four interconnected weaknesses that would exist if any
+single component were missing:
 
-1. **Credit risk constraints.** Offering an unsuitable loan to a high-risk borrower
-   (low FICO, high DTI) is not just a relevance failure — it can cause real harm.
-   A purely collaborative signal ("users like you also applied for X") ignores
-   the borrower's current financial health.
+### 1. Approval Prediction alone is not enough
+An XGBoost model predicts the probability that a borrower will repay a loan. If this
+were the **only** component, a rejected borrower simply hits a dead end — they leave
+without completing their lending demand and the business loses a potential customer.
 
-2. **Sparse, implicit feedback.** Borrowers don't rate loans. The only signal is
-   behavioural: a repaid or currently active loan is a positive interaction; a
-   charge-off or default is a negative one. This makes the recommendation problem
-   an implicit feedback problem with a heavily skewed positive/negative ratio.
+### 2. Recommendation alone is not enough
+A pure recommendation system (without the approval prediction layer) would freely
+suggest loan products to borrowers who have a low estimated repayment rate. Getting
+approved for an unsuitable product can lead to default, which directly harms the
+business's credit portfolio health.
 
-### The Synthetic Item Catalog
+### 3. Without LLM re-ranking, the RecSys is context-blind
+A collaborative-filtering system only knows what past users like this borrower
+accepted historically. It has no understanding of **why the borrower is borrowing
+right now**. A user who says *"I want to buy a car worth $50,000"* should see
+auto-loan products ranked first — not debt-consolidation loans that their profile
+historically correlates with. The **LLM re-ranker** reads either the structured
+form data or a free-text natural language prompt to reorder candidates by contextual
+relevance.
 
-Rather than treating each of the ~2.2 million historical loan applications as a
-unique item — which would produce a nearly non-repeatable interaction matrix —
-this project defines a **recommendable product** as a unique combination of
-**(Grade, Purpose, Term)**. For example:
-
-> `B_debt_consolidation_36 months` → `item_idx = 42`
-
-This maps the LendingClub dataset into a retail-banking scenario: a lender
-recommends **types** of credit products to new borrowers, not past individual loans.
-The approach constrains the item space to **~181 distinct product configurations**
-(7 grades × 14 purposes × 2 terms), making the recommendation problem tractable
-while preserving the meaningful financial attributes that drive credit decisions.
+### 4. Without an Internal Dashboard, business intelligence is lost
+Every approval check is a sales opportunity. The **Internal Staff Dashboard** logs
+each applicant query (with their profile, requested amount, and approval outcome)
+so that staff can identify rejected customers for upsell and telesales follow-up.
 
 ---
 
-## Pipeline Architecture
-
-The system implements a classic **retrieval → ranking → re-ranking funnel**,
-where each stage narrows the candidate pool and refines the ordering:
+## System Architecture
 
 ```
-Raw CSV (LendingClub)
-    │
-    ▼
-Preprocessing            ← binary interactions, time-based split, feature engineering
-    │
-    ├──▶ ALS Training    ← factorises the implicit interaction matrix (factors=64)
-    │         │
-    │         ▼
-    │    FAISS Index     ← L2-normalised inner product (cosine similarity)
-    │                       top-50 candidates in < 1 ms per user
-    │
-    ├──▶ DeepFM Ranking  ← re-scores FAISS pool using user × item feature interactions
-    │         │              (FICO, DTI, grade, purpose, term, income, home_ownership)
-    │         ▼             keeps top-10 candidates
-    │
-    └──▶ Gemini LLM      ← zero-shot re-ranking using natural language reasoning
-              │              models: gemini-2.5-pro / gemini-3.0-pro-preview
-              ▼
-         Final top-5     ← evaluated at NDCG@5 and Recall@5
+Borrower Input (Identity ID + Loan Request)
+        │
+        ▼
+ Approval Prediction (XGBoost + IsotonicRegression Calibrator)
+        │
+        ├─ APPROVED ──────────────────────────────────────┐
+        └─ REJECTED → show recommendations immediately    │
+                                                          ▼
+                    ALS Retrieval ← FAISS top-50 candidates
+                          │
+                          ▼
+            Repayment Filter (≥65%) ← remove risky products
+                          │
+                          ▼
+                    DeepFM Ranking ← top-10 candidates
+                          │
+                          ▼
+               LLM Re-ranking (OpenAI / Anthropic)
+               ├─ Prompt Mode: free-text borrower intent
+               └─ Form Mode: structured loan request data
+                          │
+                          ▼
+                    Final Top-5 Recommendations
+                          │
+                          ▼
+               Internal Staff Dashboard (CSV log)
 ```
 
-### Stage 1 — Retrieval (ALS + FAISS)
-
-Alternating Least Squares factorises the sparse user×item interaction matrix into
-64-dimensional embeddings. User and item vectors are L2-normalised and indexed with
-`faiss.IndexFlatIP` for exact inner product search. For this item catalog size
-(n_items ≈ 181), exact search is computationally trivial; the FAISS architecture
-is retained to demonstrate production-readiness at scale.
+### Stage 1 — Retrieval (ALS + FAISS + Filter)
+ALS factorises the implicit user×item interaction matrix into 64-dimensional embeddings.
+Vectors are L2-normalised and indexed with `faiss.IndexFlatIP` for fast similarity
+retrieval. **New Enhancement:** Immediately after retrieval, candidates are passed 
+through the calibrated XGBoost repay predictor; only products with a **≥65% 
+repayment probability** are passed to the ranking model. This ensures the recommendation
+funnel is "safety-first".
 
 ### Stage 2 — Ranking (DeepFM)
+A DeepFM model re-scores the FAISS candidate pool by jointly modelling second-order
+feature interactions (FM layer) and higher-order interactions (MLP), trained on
+popularity-weighted negative samples to reduce popularity bias.
 
-A DeepFM model re-scores the FAISS candidates by jointly learning second-order
-feature interactions (Factorisation Machine layer) and higher-order interactions
-(deep MLP). The FM and MLP branches share the same embedding table, and the model
-is trained with `BCEWithLogitsLoss` on popularity-weighted negative samples
-(item frequency^0.75) to reduce popularity bias.
+### Stage 3 — LLM Re-ranking
+The top-10 candidates are passed to OpenAI or Anthropic with a prompt encoding the
+borrower's financial profile. In **AI Prompt Mode**, the borrower's free-text intent
+(e.g. *"I want to buy a car worth $50,000"*) drives semantic reranking: the LLM
+deduces the purpose, derives the required loan amount, and sorts candidates by
+interest rate, term, and grade.
 
-### Stage 3 — LLM Re-ranking (Gemini)
-
-The top-10 DeepFM candidates are passed to Gemini with a structured prompt that
-includes the borrower's FICO score, DTI, income, home ownership, state, and their
-full history of previously accepted loans. Gemini reasons in natural language about
-credit suitability and returns a re-ordered list of item IDs via
-`response_mime_type="application/json"` with `response_schema=list[str]` (native
-structured output — no prompt hacking required).
-
-Borrowers are classified as:
-- **Warm Start** — ≥ 1 interaction in the training matrix; Gemini can exploit
-  historical loan pattern matching.
-- **Cold Start** — no training history; Gemini falls back to pure credit risk
-  reasoning from demographics.
+### Calibrated Approval Prediction
+Raw XGBoost probabilities are post-processed through an **IsotonicRegression
+calibrator** trained on the held-out validation split, yielding empirically
+calibrated repayment probabilities. The approval threshold is **65%**.
 
 ---
 
-## Key Findings
+## Key Results
 
-| Stage | All Users NDCG@5 | All Users Recall@5 | Warm Start NDCG@5 | Cold Start NDCG@5 |
-|-------|:-:|:-:|:-:|:-:|
-| Stage 1 — Retrieval Only | ~0.18 | ~0.14 | ~0.21 | ~0.12 |
-| Stage 2 — Retrieval + Ranking (DeepFM) | ~0.28 | ~0.22 | ~0.32 | ~0.19 |
-| Stage 3 — + LLM (best model) | ~0.31 | ~0.25 | ~0.38 | ~0.18 |
-
-> **Note:** Numbers above are indicative of relative improvement trends;
-> exact values depend on the random user sample and data version used.
-> Run `python -m evaluation.ablation_study` to reproduce on your artefacts.
-
-**Key observations:**
-
-- **DeepFM over Retrieval** is the largest single uplift, driven by its ability
-  to capture FICO × grade and DTI × purpose interactions that ALS cannot model.
-- **LLM uplift is concentrated on Warm Start users.** When Gemini can match
-  a borrower's prior loan characteristics (Grade, Term, Purpose), it consistently
-  promotes the most likely accepted products into the top-5. For Cold Start users
-  with no history, the LLM has only demographics to reason from and its uplift
-  is smaller and less consistent.
-- **Graceful degradation:** On any API failure (429 rate limit, 503 service
-  unavailable), the system falls back to the DeepFM ranking silently, ensuring
-  zero recommendation latency regression.
+| Stage | NDCG@5 | Recall@5 |
+|-------|:------:|:--------:|
+| Stage 1 — Retrieval Only | ~0.18 | ~0.14 |
+| Stage 2 — + DeepFM Ranking | ~0.28 | ~0.22 |
+| Stage 3 — + LLM Re-ranking | ~0.31 | ~0.25 |
 
 ---
 
@@ -133,20 +114,21 @@ Borrowers are classified as:
 ### Prerequisites
 
 ```bash
-# Conda (recommended — resolves PyTorch + FAISS native deps)
 conda env create -f environment.yml
 conda activate credit_recsys
-
-# Or pip
+# or
 pip install -r requirements.txt
 ```
 
 ### Environment Variables
 
-Create a `.env` file in the project root (never commit secrets):
+Create a `.env` file in the project root:
 
 ```bash
-GOOGLE_API_KEY=AIza...          # Required for LLM re-ranking (Stage 3)
+OPENAI_API_KEY=sk-...         # for OpenAI LLM re-ranking
+# or
+ANTHROPIC_API_KEY=sk-ant-...  # for Anthropic Claude
+LLM_PROVIDER=openai           # "openai" or "anthropic"
 ```
 
 ### 1. Download LendingClub Data
@@ -157,116 +139,82 @@ bash scripts/download_data.sh   # requires ~/.kaggle/kaggle.json
 
 Place `accepted_2007_to_2018Q4.csv` in `data/raw/`.
 
-### 2. Run the Offline Training Pipeline
+### 2. Run the Training Pipeline
 
 ```bash
 bash scripts/run_pipeline.sh
 ```
 
-This sequentially executes:
-
 | Step | Script | Output |
 |------|--------|--------|
-| 1 | `preprocessing/build_interactions.py` | `train/val/test_interactions.npz` |
-| 2 | `preprocessing/feature_engineering.py` | `user_features.npy`, `item_features.npy`, `encoders.pkl` |
-| 3 | `retrieval/train_als.py` | `als_user_embeddings.npy`, `als_item_embeddings.npy` |
-| 4 | `retrieval/build_faiss_index.py` | `faiss.index` |
-| 5 | `ranking/train_ranking.py` | `ranking_model.pt` |
+| 1 | `preprocessing/build_interactions.py` | interaction matrices |
+| 2 | `preprocessing/feature_engineering.py` | feature arrays + encoders |
+| 3 | `retrieval/train_als.py` | ALS embeddings |
+| 4 | `retrieval/build_faiss_index.py` | FAISS index |
+| 5 | `ranking/train_ranking.py` | DeepFM model |
+| 6 | `ranking/train_xgboost.py` | XGBoost repay model |
+| 7 | `ranking/train_calibrator.py` | IsotonicRegression calibrator |
 
-### 3. Run the Ablation Study
+### 3. Launch the Streamlit App
 
 ```bash
-# Default: k=5, 20 users (warm-start prioritised), pool=50 FAISS candidates
-python -m evaluation.ablation_study
+streamlit run app.py
+```
 
-# Custom
+Open `http://localhost:8501` in your browser.
+
+### 4. Run the Ablation Study
+
+```bash
 python -m evaluation.ablation_study --k 5 --n-users 100 --pool 50
 ```
 
-Results are printed to stdout and saved to `evaluation/ablation_results.csv`.
+---
 
-### 4. Start the API
+## Application Features
 
-```bash
-# Docker (recommended)
-docker compose up --build
-
-# Or locally
-uvicorn api.main:app --reload --port 8000
-```
-
-### 5. Make a Recommendation Request
-
-```bash
-curl -X POST http://localhost:8000/recommend \
-  -H "Content-Type: application/json" \
-  -d '{"user_id": "member_123456", "top_k": 5}'
-```
-
-Interactive API docs: http://localhost:8000/docs
-
-### 6. Run Tests
-
-```bash
-pytest tests/ -v
-```
+| Feature | Description |
+|---------|-------------|
+| **Quick Recommender** | Enter Identity ID + Name to instantly get loan recommendations |
+| **Approval Check** | Full form submission with XGBoost + calibrated repayment score |
+| **AI Prompt Mode** | Natural language prompt for LLM-driven contextual recommendations |
+| **Rejection Flow** | Auto-shows recommendations + improvement tips when rejected |
+| **SHAP Explanation** | Feature-level repayment score breakdown for each applicant |
+| **Internal Dashboard** | Admin-only view of query history, charts, and acceptance metrics |
 
 ---
 
 ## Project Structure
 
 ```
-recommendation_system/
-├── preprocessing/        Data loading, interaction matrix, feature engineering
-├── models/               ALS (PyTorch), NeuMF, DeepFM model definitions
-├── retrieval/            ALS training script + FAISS index builder
-├── ranking/              Dataset, training loop (DeepFM), inference predictor
-├── api/                  FastAPI app, schemas, recommender logic, LLM reranker
-├── evaluation/           Recall@K, NDCG@K, ablation study (3-stage comparison)
-├── tests/                pytest unit + integration tests
-├── notebooks/            01_full_pipeline.ipynb — end-to-end experiment notebook
-├── scripts/              run_pipeline.sh, download_data.sh
-├── Dockerfile
-├── docker-compose.yml
+credit_product_recommendation/
+├── app.py                    Streamlit application (main entry point)
+├── api/
+│   ├── recommender.py        End-to-end recommendation pipeline
+│   ├── explain.py            SHAP explanations + improvement suggestions
+│   ├── llm_reranker.py       LLM re-ranking (OpenAI / Anthropic)
+│   └── schemas.py            Pydantic request/response schemas
+├── ranking/
+│   ├── predictor.py          DeepFM inference wrapper
+│   ├── repay_predictor.py    XGBoost + IsotonicRegression calibrator
+│   ├── train_xgboost.py      XGBoost training script
+│   └── train_calibrator.py   Calibration layer training script
+├── retrieval/                ALS training + FAISS index builder
+├── preprocessing/            Interaction matrix + feature engineering
+├── evaluation/               NDCG@K, Recall@K, ablation study
+├── generate_simulation_data.py  Seed script for internal dashboard history
+├── data/                     (gitignored) raw + processed datasets
+├── models/saved/             (gitignored) trained model artefacts
 ├── environment.yml
 └── requirements.txt
 ```
 
-See [DESIGN.md](DESIGN.md) for the full system architecture and component deep-dives.
-
 ---
 
-## API Endpoints
+## Internal Staff Dashboard
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET`  | `/health` | Liveness probe — confirms all artefacts are loaded |
-| `POST` | `/recommend` | Top-K loan recommendations for a user |
-| `GET`  | `/items` | List all known loan product types |
-| `GET`  | `/users/{user_id}` | Check if a user is in the training set |
 Access via the sidebar → **🔒 Internal Staff Dashboard** (credentials: `admin` / `admin`).
 
 Tracks per-query: Identity ID, applicant name, requested amount, purpose, repayment
 score, and approval outcome. Dashboard charts include query volume over time, purpose
 breakdown, average repayment score by purpose, and overall acceptance rate.
-
----
-
-## 🧪 Testing the Application
-
-To verify the system's logic (Approval Prediction vs. Recommendations), you can use the following test cases in the **Loan Application** tab:
-
-### 1. High Repayment Profile (Expected Result: APPROVED)
-- **Identity ID**: `100001137`
-- **Typical Input**: $10,000 | 36 Months | Debt Consolidation
-- **Outcome**: This user has a high FICO and low DTI, resulting in a safe approval score.
-
-### 2. High Risk Profiles (Expected Result: NOT APPROVED + AI Recommendations)
-- **Identity ID**: `110727087` or `68499271`
-- **Test Input**: $40,000 | 60 Months | Other
-- **Outcome**: These IDs simulate profiles with lower repayment probabilities. The system will reject the $40,000 request but will immediately show **customized recommendation packages** that they *can* safely afford.
-
-### 3. AI Personal Recommender (AI Prompt Mode)
-Enable the **"Use AI Personal Loaning Recommendation"** checkbox and try a natural language prompt:
-- **Sample Prompt**: *"I want to buy a car with price $20,000 but now I only have $10,000, which loaning package is the most suitable"*
-- **Outcome**: The LLM will deduce the "Car" purpose, calculate the $10,000 gap, and prioritize Auto-loan products in the final ranking.
