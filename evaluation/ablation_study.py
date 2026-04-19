@@ -6,8 +6,8 @@ mirroring the evaluation logic in notebooks/01_full_pipeline.ipynb §13 / §13.5
 
   Stage 1 — Retrieval Only        : ALS + FAISS top-K direct
   Stage 2 — Retrieval + Ranking   : ALS + FAISS → DeepFM re-score → top-K
-  Stage 3 — Retrieval + Ranking + LLM : Stage 2 → Gemini re-rank → top-K
-             (Stage 3 requires GOOGLE_API_KEY in the environment)
+  Stage 3 — Retrieval + Ranking + LLM : Stage 2 → OpenAI re-rank → top-K
+             (Stage 3 requires OPENAI_API_KEY in the environment)
 
 Metrics reported per stage, for ALL / Warm-Start / Cold-Start user subsets:
   • NDCG@K   (Normalised Discounted Cumulative Gain)
@@ -33,7 +33,6 @@ import scipy.sparse as sp
 import faiss
 import pandas as pd
 from typing import List, Set, Tuple, Optional
-from google import genai
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -43,9 +42,9 @@ SAVED_DIR     = os.path.join("models", "saved")
 PROCESSED_DIR = os.path.join("data", "processed")
 OUT_CSV       = os.path.join("evaluation", "ablation_results.csv")
 
-# Gemini models to evaluate in Stage 3
-GEMINI_MODEL_A = "gemini-2.5-pro"
-GEMINI_MODEL_B = "gemini-3.1-pro-preview"
+# OpenAI models to evaluate in Stage 3
+OPENAI_MODEL_A = "gpt-4o"
+OPENAI_MODEL_B = "gpt-4o-mini"
 
 
 # =============================================================================
@@ -233,7 +232,7 @@ def _build_llm_context(
     user_enc,
 ) -> Tuple[str, List[str], dict]:
     """
-    Build the Gemini prompt string for one user.
+    Build the LLM prompt string for one user.
     Mirrors prepare_llm_context() from the notebook (§13.2).
 
     Returns
@@ -319,23 +318,16 @@ def _build_llm_context(
     return context_str, original_ids, id_to_idx
 
 
-def _call_gemini(
-    gemini_client,
+def _call_openai(
+    openai_client,
     context_str: str,
     original_item_ids: List[str],
     model: str,
 ) -> List[str]:
     """
-    Call Gemini with structured JSON output and 3-attempt retry on 429/503.
+    Call OpenAI with JSON output and 3-attempt retry on 429/503.
     Falls back to original DeepFM order on persistent failure.
     """
-    try:
-        from google import genai
-        from google.genai import types
-    except ImportError:
-        print("  [ablation] google-genai not installed. Skipping LLM stage.")
-        return original_item_ids
-
     system_prompt = (
         "Role: You are a predictive behavioral analyst for LendingClub.\n"
         "Task: Select the TOP 5 loans the user is most likely to accept, "
@@ -344,20 +336,25 @@ def _call_gemini(
         "characteristics (Grade, Term, Purpose).\n\n"
         "Output: Return ONLY a JSON array of exactly 5 'item_id' strings."
     )
-    payload = f"{system_prompt}\n\nData Context:\n{context_str}"
 
     for attempt in range(3):
         try:
-            response = gemini_client.models.generate_content(
+            response = openai_client.chat.completions.create(
                 model=model,
-                contents=payload,
-                config=types.GenerateContentConfig(
-                    temperature=0.0,
-                    response_mime_type="application/json",
-                    response_schema=list[str],
-                ),
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": f"Data Context:\n{context_str}"},
+                ],
+                temperature=0.0,
+                max_tokens=512,
+                response_format={"type": "json_object"},
             )
-            ranked = json.loads(response.text.strip())
+            raw = response.choices[0].message.content.strip()
+            # Response may be {"items": [...]} or a bare array — handle both
+            parsed = json.loads(raw)
+            ranked = parsed if isinstance(parsed, list) else next(
+                (v for v in parsed.values() if isinstance(v, list)), None
+            )
             if not isinstance(ranked, list):
                 return original_item_ids
             valid_set = set(original_item_ids)
@@ -367,9 +364,9 @@ def _call_gemini(
 
         except Exception as e:
             err = str(e)
-            if any(code in err for code in ("503", "429", "RESOURCE_EXHAUSTED")):
+            if any(code in err for code in ("503", "429", "rate_limit")):
                 wait = 15 * (attempt + 1)
-                print(f"    [Retry {attempt+1}/3] {model} busy, "
+                print(f"    [Retry {attempt+1}/3] {model} rate-limited, "
                       f"waiting {wait}s …")
                 time.sleep(wait)
             else:
@@ -394,32 +391,34 @@ def stage_retrieval_ranking_llm(
     k: int,
     pool: int,
     deepfm_top_n: int = 10,
-    inter_user_sleep: float = 20.0,
-    inter_model_sleep: float = 5.0,
+    inter_user_sleep: float = 1.0,
+    inter_model_sleep: float = 0.5,
 ) -> Optional[Tuple[List[dict], List[dict]]]:
     """
-    Stage 3: FAISS → DeepFM top-{deepfm_top_n} → Gemini re-rank (both models).
+    Stage 3: FAISS → DeepFM top-{deepfm_top_n} → OpenAI re-rank (both models).
 
     Returns (results_model_a, results_model_b) or None if no API key found.
     Each result list mirrors the structure of stages 1 & 2.
     """
-   
-    api_key = os.getenv("GOOGLE_API_KEY")
+    api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        print("  [ablation] GOOGLE_API_KEY not set — skipping LLM stage.")
+        print("  [ablation] OPENAI_API_KEY not set — skipping LLM stage.")
         return None
 
-
-    gemini_client  = genai.Client(api_key=api_key)
+    import openai
+    openai_client = openai.OpenAI(api_key=api_key)
     item_lookup_idx = item_lookup.set_index("item_idx")
     user_enc       = enc["user_enc"]
 
     results_a, results_b = [], []
+    total = len(sample_users)
 
-    for user_idx, user_type in sample_users:
+    for i, (user_idx, user_type) in enumerate(sample_users, 1):
         gt = set(int(x) for x in test_mat.getrow(user_idx).nonzero()[1])
         if not gt:
             continue
+        print(f"  [Stage 3] user {i}/{total}  idx={user_idx}  ({user_type})",
+              flush=True)
 
         # FAISS retrieval
         u_vec = user_emb[user_idx].astype("float32").reshape(1, -1)
@@ -439,7 +438,7 @@ def stage_retrieval_ranking_llm(
         )
 
         # Model A
-        reranked_a = _call_gemini(gemini_client, ctx, orig_ids, GEMINI_MODEL_A)
+        reranked_a = _call_openai(openai_client, ctx, orig_ids, OPENAI_MODEL_A)
         ranked_a   = [id_to_idx[i] for i in reranked_a if i in id_to_idx]
         results_a.append(dict(
             user_idx  = user_idx,
@@ -450,7 +449,7 @@ def stage_retrieval_ranking_llm(
         time.sleep(inter_model_sleep)
 
         # Model B
-        reranked_b = _call_gemini(gemini_client, ctx, orig_ids, GEMINI_MODEL_B)
+        reranked_b = _call_openai(openai_client, ctx, orig_ids, OPENAI_MODEL_B)
         ranked_b   = [id_to_idx[i] for i in reranked_b if i in id_to_idx]
         results_b.append(dict(
             user_idx  = user_idx,
@@ -532,7 +531,7 @@ def run_ablation(k: int = 5, n_users: int = 20, pool: int = 50) -> pd.DataFrame:
 
     # ── Stage 3 ───────────────────────────────────────────────────────────────
     print(f"Stage 3: Retrieval + Ranking + LLM "
-          f"({GEMINI_MODEL_A}  /  {GEMINI_MODEL_B}) …")
+          f"({OPENAI_MODEL_A}  /  {OPENAI_MODEL_B}) …")
     llm_out = stage_retrieval_ranking_llm(
         user_emb, faiss_index, predictor, train_mat, test_mat,
         enc, item_lookup, user_profiles_raw, sampled,
@@ -549,10 +548,10 @@ def run_ablation(k: int = 5, n_users: int = 20, pool: int = 50) -> pd.DataFrame:
     _print_section("Stage 2 — Retrieval + Ranking",         r2,  k)
     print()
     if r3a:
-        _print_section(f"Stage 3 — + LLM ({GEMINI_MODEL_A})", r3a, k)
+        _print_section(f"Stage 3 — + LLM ({OPENAI_MODEL_A})", r3a, k)
         print()
     if r3b:
-        _print_section(f"Stage 3 — + LLM ({GEMINI_MODEL_B})", r3b, k)
+        _print_section(f"Stage 3 — + LLM ({OPENAI_MODEL_B})", r3b, k)
         print()
     print("═" * 80)
 
@@ -572,8 +571,8 @@ def run_ablation(k: int = 5, n_users: int = 20, pool: int = 50) -> pd.DataFrame:
             row[f"{stage_lbl}_Recall@{k}"]  = m[f"Recall@{k}"] if m else float("nan")
 
         for stage_lbl, stage_results in [
-            (f"Stage3_{GEMINI_MODEL_A.replace('.', '_')}", r3a),
-            (f"Stage3_{GEMINI_MODEL_B.replace('.', '_')}", r3b),
+            (f"Stage3_{OPENAI_MODEL_A.replace('.', '_')}", r3a),
+            (f"Stage3_{OPENAI_MODEL_B.replace('.', '_')}", r3b),
         ]:
             if stage_results is not None:
                 m = _subset_metrics(stage_results, sub, k)

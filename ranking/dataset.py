@@ -108,6 +108,25 @@ class RankingDataset(Dataset):
                 print("  [RankingDataset] Feature files not found; "
                       "running without side features.")
 
+        # Compute XGBoost repay scores for all pairs (one-time, at init)
+        self.repay_scores = None
+        xgb_path = os.path.join("models", "saved", "xgboost_repay.json")
+        if (use_features and os.path.exists(xgb_path)
+                and self.user_features is not None
+                and self.item_features is not None):
+            import xgboost as xgb
+            _repay_model = xgb.Booster()
+            _repay_model.load_model(xgb_path)
+            X = np.hstack([
+                self.user_features[self.users],
+                self.item_features[self.items],
+            ])
+            self.repay_scores = _repay_model.predict(
+                xgb.DMatrix(X)
+            ).astype(np.float32)
+            print(f"  [RankingDataset] Computed XGBoost repay scores  "
+                  f"mean={self.repay_scores.mean():.3f}")
+
         print(f"  [RankingDataset] {split}: {len(self)} samples  "
               f"(pos={len(pos_users):,}, neg={len(self)-len(pos_users):,})")
 
@@ -127,5 +146,8 @@ class RankingDataset(Dataset):
         if self.item_features is not None:
             sample["item_feats"] = torch.tensor(
                 self.item_features[self.items[idx]], dtype=torch.float32)
+        if self.repay_scores is not None:
+            sample["repay_score"] = torch.tensor(
+                [self.repay_scores[idx]], dtype=torch.float32)  # shape (1,)
 
         return sample

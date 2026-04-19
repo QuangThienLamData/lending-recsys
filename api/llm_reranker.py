@@ -30,7 +30,8 @@ MAX_TOKENS   = 512
 
 # ── Prompt builder ───────────────────────────────────────────────────────────
 
-def _build_prompt(user_profile: dict, candidates: pd.DataFrame) -> str:
+def _build_prompt(user_profile: dict, candidates: pd.DataFrame,
+                  loan_request: dict, user_prompt: str = None) -> str:
     """
     Construct a structured prompt for the LLM.
 
@@ -41,15 +42,29 @@ def _build_prompt(user_profile: dict, candidates: pd.DataFrame) -> str:
     candidates   : DataFrame  one row per candidate item with columns:
                                 item_idx, item_id, grade, purpose, term,
                                 int_rate, loan_amnt, positive_rate
+    loan_request : dict   keys: purpose, loan_amnt, int_rate
     """
+    inc = user_profile.get('annual_inc')
+    inc_str = f"${inc:,.0f}" if isinstance(inc, (int, float)) else "unknown"
     profile_str = (
-        f"- Annual income: ${user_profile.get('annual_inc', 'unknown'):,}\n"
+        f"- Annual income: {inc_str}\n"
         f"- Debt-to-income ratio: {user_profile.get('dti', 'unknown')}%\n"
         f"- FICO score: {user_profile.get('fico_range_low', '?')}–"
         f"{user_profile.get('fico_range_high', '?')}\n"
         f"- Home ownership: {user_profile.get('home_ownership', 'unknown')}\n"
         f"- State: {user_profile.get('addr_state', 'unknown')}"
     )
+
+    purpose   = loan_request.get("purpose") or "any"
+    loan_amnt = loan_request.get("loan_amnt")
+    int_rate  = loan_request.get("int_rate")
+
+    request_lines = [f"- Requested purpose: {purpose.replace('_', ' ')}"]
+    if loan_amnt:
+        request_lines.append(f"- Requested loan amount: ${loan_amnt:,.0f}")
+    if int_rate:
+        request_lines.append(f"- Requested interest rate: {int_rate:.1f}%")
+    request_str = "\n".join(request_lines)
 
     items_str = "\n".join(
         f"  {i+1}. [{row['item_id']}] Grade={row['grade']}, "
@@ -59,19 +74,48 @@ def _build_prompt(user_profile: dict, candidates: pd.DataFrame) -> str:
         for i, (_, row) in enumerate(candidates.iterrows())
     )
 
-    return (
-        "You are a financial advisor helping rank loan products for a borrower.\n\n"
-        "Borrower profile:\n"
+    instructions = (
+        "You are a loan product ranker. Your job is to reorder loan products strictly "
+        "according to how well they match the borrower's explicit request — "
+        "IGNORE the machine learning model's original order entirely.\n\n"
+        "Borrower's loan request (these are the PRIMARY criteria):\n"
+        f"{request_str}\n\n"
+        "Borrower profile (secondary context):\n"
         f"{profile_str}\n\n"
-        "Candidate loan products (already pre-ranked by a machine learning model):\n"
+        "Candidate loan products:\n"
         f"{items_str}\n\n"
-        "Task: Reorder the products so the most suitable ones for this specific "
-        "borrower appear first. Consider the borrower's income, credit score, and "
-        "risk tolerance. Return ONLY a JSON array of the product item_ids in your "
-        "preferred order, e.g.:\n"
-        '["B_debt_consolidation_36 months", "A_home_improvement_60 months", ...]\n\n'
-        "Your reranked order:"
     )
+
+    if user_prompt and user_prompt.strip():
+        instructions += (
+            f"USER'S SPECIFIC SCENARIO AND PROMPT: {user_prompt.strip()}\n\n"
+            "STRICT ranking rules based on the user's prompt above — apply exactly in this order:\n"
+            "  1. PURPOSE DEDUCTION: Infer the actual semantic purpose from the user's prompt (e.g., buying a car implies Purpose='car', renovating a house implies Purpose='home_improvement'). You MUST absolutely prioritize products matching this inferred purpose at the very top. Ignore the requested purpose in the form if it contradicts the prompt.\n"
+            "  2. LOAN AMOUNT MATH: Calculate the exact amount they need (e.g., total asset price minus cash they have). Rank the products that have an AvgAmount as close as possible to this required amount.\n"
+            "  3. FINANCIAL BENEFITS: Among items with the correct purpose and similar required amounts, strictly sort by:\n"
+            "      a. Lowest Rate (Interest Rate) first.\n"
+            "      b. Shortest Term first (e.g., '36 months' preferred over '60 months').\n"
+            "      c. Highest Grade (Grade A is best, then B, etc.).\n"
+        )
+    else:
+        instructions += (
+            "STRICT ranking rules — apply in order:\n"
+            "  1. PURPOSE (most important): Products whose Purpose exactly matches the "
+            f"requested purpose '{purpose}' MUST come before any non-matching purpose. "
+            "This rule overrides all other criteria.\n"
+            "  2. LOAN AMOUNT: Among products with the same purpose priority, rank by "
+            "closest AvgAmount to the requested amount.\n"
+            "  3. INTEREST RATE: Among ties, rank by closest Rate to the requested rate.\n"
+            "  4. BORROWER FIT: Use FICO, income, DTI as a tiebreaker only.\n"
+        )
+
+    instructions += (
+        "\nReturn ONLY a JSON array of ALL item_ids in your reranked order. "
+        "Do not drop any items. Example:\n"
+        '["B_car_36 months", "A_car_60 months", "C_debt_consolidation_36 months"]\n\n'
+        "Reranked order:"
+    )
+    return instructions
 
 
 # ── LLM call ─────────────────────────────────────────────────────────────────
@@ -122,15 +166,18 @@ def _parse_response(response_text: str, original_item_ids: List[str]) -> List[st
 def llm_rerank(
     user_profile: dict,
     candidates: pd.DataFrame,
+    loan_request: dict = None,
+    user_prompt: str = None,
 ) -> pd.DataFrame:
     """
     Rerank candidate loan products using an LLM.
 
     Parameters
     ----------
-    user_profile : dict    borrower attributes
+    user_profile : dict    borrower demographics
     candidates   : pd.DataFrame  columns include item_id, grade, purpose, …
                                  already sorted by ranking model score
+    loan_request : dict    user's loan request: purpose, loan_amnt, int_rate
 
     Returns
     -------
@@ -151,7 +198,7 @@ def llm_rerank(
         return candidates
 
     original_ids = candidates["item_id"].tolist()
-    prompt = _build_prompt(user_profile, candidates)
+    prompt = _build_prompt(user_profile, candidates, loan_request or {}, user_prompt)
 
     try:
         if provider == "openai":

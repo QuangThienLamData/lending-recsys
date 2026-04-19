@@ -44,10 +44,11 @@ class RankingPredictor:
         with open(meta_path) as f:
             meta = json.load(f)
 
-        self.n_users      = meta["n_users"]
-        self.n_items      = meta["n_items"]
+        self.n_users       = meta["n_users"]
+        self.n_items       = meta["n_items"]
         self.user_feat_dim = meta.get("user_feat_dim", 0)
         self.item_feat_dim = meta.get("item_feat_dim", 0)
+        self.repay_feat_dim = meta.get("repay_feat_dim", 0)
         self.model_type    = meta.get("model_type", "neumf")
 
         # Build model skeleton
@@ -56,6 +57,7 @@ class RankingPredictor:
             self.model = build_neumf(
                 self.n_users, self.n_items,
                 self.user_feat_dim, self.item_feat_dim,
+                self.repay_feat_dim,
             )
         else:
             from models.deepfm_model import build_deepfm
@@ -94,6 +96,17 @@ class RankingPredictor:
         else:
             print(f"[RankingPredictor] WARNING: Feature arrays not found in {data_dir}!")
 
+        # Load XGBoost repay predictor if available
+        self.repay_predictor = None
+        xgb_path = os.path.join(SAVED_DIR, "xgboost_repay.json")
+        if self.repay_feat_dim > 0 and os.path.exists(xgb_path):
+            from ranking.repay_predictor import RepayPredictor
+            self.repay_predictor = RepayPredictor(
+                model_path=xgb_path,
+                user_features=self.user_features,
+                item_features=self.item_features,
+            )
+
     @torch.no_grad()
     def score_candidates(
         self,
@@ -116,7 +129,7 @@ class RankingPredictor:
         u_tensor = torch.tensor([user_idx] * n, dtype=torch.long, device=self.device)
         i_tensor = torch.tensor(candidate_item_idxs, dtype=torch.long, device=self.device)
 
-        uf = itf = None
+        uf = itf = rpf = None
         if self.user_features is not None:
             uf = torch.tensor(
                 self.user_features[[user_idx] * n], dtype=torch.float32,
@@ -127,9 +140,16 @@ class RankingPredictor:
                 self.item_features[candidate_item_idxs], dtype=torch.float32,
                 device=self.device,
             )
+        if self.repay_predictor is not None and self.repay_feat_dim > 0:
+            repay_scores = self.repay_predictor.predict(
+                np.array([user_idx] * n), candidate_item_idxs
+            )
+            rpf = torch.tensor(
+                repay_scores.reshape(-1, 1), dtype=torch.float32, device=self.device
+            )
 
         if self.model_type == "neumf":
-            scores = self.model(u_tensor, i_tensor, uf, itf)
+            scores = self.model(u_tensor, i_tensor, uf, itf, rpf)
         else:
             sparse_in = torch.stack([u_tensor, i_tensor], dim=1)
             dense_in  = None

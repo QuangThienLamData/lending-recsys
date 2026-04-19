@@ -54,22 +54,22 @@ echo "============================================================"
 
 # ── Step 1: Build interaction matrices ───────────────────────────────────────
 echo ""
-echo "[1/6] Building interaction matrices …"
+echo "[1/7] Building interaction matrices …"
 python -m preprocessing.build_interactions --raw "$RAW_CSV"
 
 # ── Step 2: Feature engineering ──────────────────────────────────────────────
 echo ""
-echo "[2/6] Engineering features …"
+echo "[2/7] Engineering features …"
 python -m preprocessing.feature_engineering
 
 # ── Step 3: Generate negative samples ────────────────────────────────────────
 echo ""
-echo "[3/6] Generating negative samples …"
+echo "[3/7] Generating negative samples …"
 python -m preprocessing.negative_sampler --k-neg 4
 
 # ── Step 4: Train ALS ────────────────────────────────────────────────────────
 echo ""
-echo "[4/6] Training ALS …"
+echo "[4/7] Training ALS …"
 python -m retrieval.train_als \
   --factors "$ALS_FACTORS" \
   --iterations "$ALS_ITER" \
@@ -77,12 +77,17 @@ python -m retrieval.train_als \
 
 # ── Step 5: Build FAISS index ─────────────────────────────────────────────────
 echo ""
-echo "[5/6] Building FAISS index …"
+echo "[5/7] Building FAISS index …"
 python -m retrieval.build_faiss_index --index-type auto
 
-# ── Step 6: Train ranking model ───────────────────────────────────────────────
+# ── Step 6: Train XGBoost repayment predictor ─────────────────────────────────
 echo ""
-echo "[6/6] Training ranking model ($RANK_MODEL) …"
+echo "[6/7] Training XGBoost repayment predictor …"
+python -m ranking.train_xgboost
+
+# ── Step 7: Train ranking model ───────────────────────────────────────────────
+echo ""
+echo "[7/7] Training ranking model ($RANK_MODEL) …"
 python -m ranking.train_ranking \
   --model "$RANK_MODEL" \
   --epochs "$RANK_EPOCHS"

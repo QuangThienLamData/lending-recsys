@@ -41,3 +41,15 @@ Thumbs.db
 evaluation/results.json
 evaluation/ablation_results.csv
 .claude
+
+# ── Simulation / runtime data ─────────────────────────────────────────────────
+data/simulation_data.csv
+
+# ── Scratch / dev scripts ─────────────────────────────────────────────────────
+find_low_score_user.py
+test_id.md
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+api_restart.log
+api_server.log

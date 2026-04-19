@@ -44,6 +44,7 @@ class NeuMF(nn.Module):
         emb_dim: int = 32,
         user_feat_dim: int = 0,
         item_feat_dim: int = 0,
+        repay_feat_dim: int = 0,
         mlp_layers: List[int] = None,
         dropout: float = 0.2,
     ):
@@ -51,9 +52,10 @@ class NeuMF(nn.Module):
         if mlp_layers is None:
             mlp_layers = [128, 64, 32]
 
-        self.emb_dim       = emb_dim
-        self.user_feat_dim = user_feat_dim
-        self.item_feat_dim = item_feat_dim
+        self.emb_dim        = emb_dim
+        self.user_feat_dim  = user_feat_dim
+        self.item_feat_dim  = item_feat_dim
+        self.repay_feat_dim = repay_feat_dim
 
         # ── GMF embeddings ──────────────────────────────────────────────
         self.user_emb_gmf = nn.Embedding(n_users, emb_dim)
@@ -64,7 +66,7 @@ class NeuMF(nn.Module):
         self.item_emb_mlp = nn.Embedding(n_items, emb_dim)
 
         # ── MLP tower ───────────────────────────────────────────────────
-        mlp_input_dim = 2 * emb_dim + user_feat_dim + item_feat_dim
+        mlp_input_dim = 2 * emb_dim + user_feat_dim + item_feat_dim + repay_feat_dim
         mlp_modules   = []
         in_dim = mlp_input_dim
         for out_dim in mlp_layers:
@@ -96,11 +98,12 @@ class NeuMF(nn.Module):
 
     def forward(
         self,
-        user_idx: torch.Tensor,          # (B,)
-        item_idx: torch.Tensor,          # (B,)
-        user_feats: torch.Tensor = None, # (B, user_feat_dim)  optional
-        item_feats: torch.Tensor = None, # (B, item_feat_dim)  optional
-    ) -> torch.Tensor:                   # (B,) scores in (0,1)
+        user_idx: torch.Tensor,           # (B,)
+        item_idx: torch.Tensor,           # (B,)
+        user_feats: torch.Tensor = None,  # (B, user_feat_dim)   optional
+        item_feats: torch.Tensor = None,  # (B, item_feat_dim)   optional
+        repay_feats: torch.Tensor = None, # (B, 1)               optional XGBoost score
+    ) -> torch.Tensor:                    # (B,) scores in (0,1)
 
         # GMF branch
         ug = self.user_emb_gmf(user_idx)   # (B, d)
@@ -116,6 +119,8 @@ class NeuMF(nn.Module):
             mlp_input = torch.cat([mlp_input, user_feats], dim=-1)
         if item_feats is not None and self.item_feat_dim > 0:
             mlp_input = torch.cat([mlp_input, item_feats], dim=-1)
+        if repay_feats is not None and self.repay_feat_dim > 0:
+            mlp_input = torch.cat([mlp_input, repay_feats], dim=-1)
 
         mlp_out = self.mlp(mlp_input)      # (B, mlp_layers[-1])
 
@@ -128,7 +133,8 @@ class NeuMF(nn.Module):
 # ── Convenience factory ─────────────────────────────────────────────────────
 
 def build_neumf(n_users: int, n_items: int,
-                user_feat_dim: int = 0, item_feat_dim: int = 0) -> NeuMF:
+                user_feat_dim: int = 0, item_feat_dim: int = 0,
+                repay_feat_dim: int = 0) -> NeuMF:
     """Default NeuMF configuration used throughout the project."""
     return NeuMF(
         n_users=n_users,
@@ -136,6 +142,7 @@ def build_neumf(n_users: int, n_items: int,
         emb_dim=32,
         user_feat_dim=user_feat_dim,
         item_feat_dim=item_feat_dim,
+        repay_feat_dim=repay_feat_dim,
         mlp_layers=[128, 64, 32],
         dropout=0.2,
     )

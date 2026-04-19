@@ -19,6 +19,10 @@ import json
 import pickle
 import logging
 from contextlib import asynccontextmanager
+from dotenv import load_dotenv
+
+# Load .env from project root (works regardless of working directory)
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 import numpy as np
 import pandas as pd
@@ -43,7 +47,8 @@ FAISS_INDEX_PATH  = os.getenv("FAISS_INDEX_PATH",   os.path.join(MODEL_DIR, "fai
 RANKING_MODEL_PATH= os.getenv("RANKING_MODEL_PATH", os.path.join(MODEL_DIR, "ranking_model.pt"))
 ENCODERS_PATH     = os.getenv("ENCODERS_PATH",      os.path.join(MODEL_DIR, "encoders.pkl"))
 META_PATH         = os.path.join("data", "processed", "feature_meta.json")
-ITEM_LOOKUP_PATH  = os.path.join("data", "processed", "item_lookup.csv")
+ITEM_LOOKUP_PATH        = os.path.join("data", "processed", "item_lookup.csv")
+USER_PROFILE_PATH       = os.path.join("data", "processed", "user_profile_lookup.parquet")
 USER_EMB_PATH     = os.path.join(MODEL_DIR, "als_user_embeddings.npy")
 ITEM_EMB_PATH     = os.path.join(MODEL_DIR, "als_item_embeddings.npy")
 
@@ -59,8 +64,11 @@ async def lifespan(app: FastAPI):
     # 1. Encoders (LabelEncoder for user_id and item_id)
     with open(ENCODERS_PATH, "rb") as f:
         enc = pickle.load(f)
-    artefacts["user_enc"] = enc["user_enc"]
-    artefacts["item_enc"] = enc["item_enc"]
+    artefacts["user_enc"]         = enc["user_enc"]
+    artefacts["item_enc"]         = enc["item_enc"]
+    artefacts["user_transformer"] = enc.get("user_transformer")
+    artefacts["item_transformer"] = enc.get("item_transformer")
+    artefacts["top_states"]       = enc.get("top_states", [])
     logger.info("  Loaded encoders  (users=%d, items=%d)",
                 len(artefacts["user_enc"].classes_),
                 len(artefacts["item_enc"].classes_))
@@ -76,7 +84,7 @@ async def lifespan(app: FastAPI):
     logger.info("  Loaded FAISS index  ntotal=%d",
                 artefacts["faiss_index"].ntotal)
 
-    # 4. Ranking model predictor
+    # 4. Ranking model predictor (also loads XGBoost repay predictor internally)
     from ranking.predictor import RankingPredictor
     artefacts["ranking_predictor"] = RankingPredictor(
         model_path=RANKING_MODEL_PATH,
@@ -85,11 +93,24 @@ async def lifespan(app: FastAPI):
     )
     logger.info("  Loaded ranking model (%s)",
                 artefacts["ranking_predictor"].model_type)
+    if artefacts["ranking_predictor"].repay_predictor is not None:
+        logger.info("  XGBoost repay predictor loaded (repay_feat_dim=%d)",
+                    artefacts["ranking_predictor"].repay_feat_dim)
+    else:
+        logger.info("  XGBoost repay predictor not found — skipping repay stage")
 
     # 5. Item lookup table
     artefacts["item_lookup"] = pd.read_csv(ITEM_LOOKUP_PATH)
     logger.info("  Loaded item_lookup  (%d items)",
                 len(artefacts["item_lookup"]))
+
+    # 6. User profile lookup (demographics for all known users)
+    if os.path.exists(USER_PROFILE_PATH):
+        artefacts["user_profile_lookup"] = pd.read_parquet(USER_PROFILE_PATH)
+        logger.info("  Loaded user_profile_lookup  (%d users)",
+                    len(artefacts["user_profile_lookup"]))
+    else:
+        logger.warning("  user_profile_lookup not found — cold-start demographics unavailable")
 
     logger.info("=== All artefacts ready.  API is live. ===")
     yield

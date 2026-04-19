@@ -17,6 +17,7 @@ Usage:
 import os
 import json
 import argparse
+import contextlib
 import numpy as np
 import scipy.sparse as sp
 import torch
@@ -44,7 +45,8 @@ def evaluate(model, val_mat: sp.csr_matrix,
              user_features: np.ndarray, item_features: np.ndarray,
              device: torch.device, k: int = 10,
              n_eval_users: int = 1000,
-             model_type: str = "neumf") -> float:
+             model_type: str = "neumf",
+             repay_predictor=None) -> float:
     """Compute mean NDCG@K over a sample of users from the val matrix."""
     model.eval()
     rows, _ = val_mat.nonzero()
@@ -54,6 +56,7 @@ def evaluate(model, val_mat: sp.csr_matrix,
 
     n_items = val_mat.shape[1]
     all_item_idx = torch.arange(n_items, device=device)
+    all_item_np  = np.arange(n_items)
     ndcg_scores  = []
 
     for u in users_with_pos:
@@ -63,9 +66,17 @@ def evaluate(model, val_mat: sp.csr_matrix,
               if user_features is not None else None)
         itf = (torch.tensor(item_features, dtype=torch.float32, device=device)
                if item_features is not None else None)
+        rpf = None
+        if repay_predictor is not None:
+            repay_scores = repay_predictor.predict(
+                np.array([u] * n_items), all_item_np
+            )
+            rpf = torch.tensor(
+                repay_scores.reshape(-1, 1), dtype=torch.float32, device=device
+            )
 
         if model_type == "neumf":
-            scores = model(u_tensor, all_item_idx, uf, itf).cpu().numpy()
+            scores = model(u_tensor, all_item_idx, uf, itf, rpf).cpu().numpy()
         else:
             sparse_in = torch.stack([u_tensor, all_item_idx], dim=1)
             dense_in  = None
@@ -102,20 +113,22 @@ def train(
     print(f"[train_ranking] Device: {device}")
 
     # Load feature metadata
-    user_feat_dim = item_feat_dim = 0
+    user_feat_dim = item_feat_dim = repay_feat_dim = 0
     if os.path.exists(META_PATH):
         with open(META_PATH) as f:
             meta = json.load(f)
-        user_feat_dim = meta.get("user_feat_dim", 0)
-        item_feat_dim = meta.get("item_feat_dim", 0)
-        n_users       = meta["n_users"]
-        n_items       = meta["n_items"]
+        user_feat_dim  = meta.get("user_feat_dim", 0)
+        item_feat_dim  = meta.get("item_feat_dim", 0)
+        repay_feat_dim = meta.get("repay_feat_dim", 0)
+        n_users        = meta["n_users"]
+        n_items        = meta["n_items"]
     else:
         mat = sp.load_npz(os.path.join(PROCESSED_DIR, "train_interactions.npz"))
         n_users, n_items = mat.shape
 
     print(f"  n_users={n_users:,}  n_items={n_items}  "
-          f"user_feat_dim={user_feat_dim}  item_feat_dim={item_feat_dim}")
+          f"user_feat_dim={user_feat_dim}  item_feat_dim={item_feat_dim}  "
+          f"repay_feat_dim={repay_feat_dim}")
 
     # ── Datasets & loaders ──────────────────────────────────────────────
     from ranking.dataset import RankingDataset
@@ -134,10 +147,21 @@ def train(
     user_features = np.load(uf_path) if os.path.exists(uf_path) and user_feat_dim > 0 else None
     item_features = np.load(if_path) if os.path.exists(if_path) and item_feat_dim > 0 else None
 
+    # ── XGBoost repay predictor for eval ────────────────────────────────
+    repay_predictor = None
+    xgb_path = os.path.join(SAVED_DIR, "xgboost_repay.json")
+    if repay_feat_dim > 0 and os.path.exists(xgb_path):
+        from ranking.repay_predictor import RepayPredictor
+        repay_predictor = RepayPredictor(
+            model_path=xgb_path,
+            user_features=user_features,
+            item_features=item_features,
+        )
+
     # ── Model ───────────────────────────────────────────────────────────
     if model_type == "neumf":
         from models.neumf_model import build_neumf
-        model = build_neumf(n_users, n_items, user_feat_dim, item_feat_dim)
+        model = build_neumf(n_users, n_items, user_feat_dim, item_feat_dim, repay_feat_dim)
     else:
         from models.deepfm_model import build_deepfm
         model = build_deepfm(n_users, n_items, dense_dim=user_feat_dim + item_feat_dim)
@@ -151,7 +175,8 @@ def train(
     optimiser  = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler  = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimiser, mode="max", factor=0.5, patience=2)
-    scaler = torch.amp.GradScaler('cuda')
+    use_amp = device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
     best_ndcg   = 0.0
     patience_ctr = 0
 
@@ -164,14 +189,16 @@ def train(
             user_idx  = batch["user_idx"].to(device)
             item_idx  = batch["item_idx"].to(device)
             labels    = batch["label"].to(device)
-            uf = batch.get("user_feats")
+            uf  = batch.get("user_feats")
             itf = batch.get("item_feats")
-            if uf is not None:  uf  = uf.to(device)
+            rpf = batch.get("repay_score")
+            if uf  is not None: uf  = uf.to(device)
             if itf is not None: itf = itf.to(device)
+            if rpf is not None: rpf = rpf.to(device)
 
-            with torch.amp.autocast('cuda'):
+            with (torch.cuda.amp.autocast() if use_amp else contextlib.nullcontext()):
                 if model_type == "neumf":
-                    preds = model(user_idx, item_idx, uf, itf)
+                    preds = model(user_idx, item_idx, uf, itf, rpf)
                 else:
                     # DeepFM: build sparse_inputs tensor [user_idx, item_idx]
                     sparse_in  = torch.stack([user_idx, item_idx], dim=1)
@@ -186,10 +213,14 @@ def train(
 
                 loss = criterion(preds, labels)
 
-            # Use the scaler to compute gradients and update weights
-            scaler.scale(loss).backward()
-            scaler.step(optimiser)
-            scaler.update()
+            if use_amp:
+                scaler.scale(loss).backward()
+                scaler.step(optimiser)
+                scaler.update()
+            else:
+                loss.backward()
+                optimiser.step()
+            optimiser.zero_grad()
 
             total_loss += loss.item() * len(labels)
 
@@ -197,7 +228,8 @@ def train(
 
         # Validation NDCG@10
         val_ndcg = evaluate(model, val_mat, user_features, item_features,
-                            device, k=10, model_type=model_type)
+                            device, k=10, model_type=model_type,
+                            repay_predictor=repay_predictor)
         scheduler.step(val_ndcg)
 
         print(f"  Epoch {epoch:>3}/{epochs}  loss={avg_loss:.4f}  "
@@ -208,7 +240,7 @@ def train(
             best_ndcg = val_ndcg
             patience_ctr = 0
             torch.save(model.state_dict(), MODEL_PATH)
-            print(f"  ✓ Saved best model (NDCG@10={best_ndcg:.4f}) → {MODEL_PATH}")
+            print(f"  [best] Saved model (NDCG@10={best_ndcg:.4f}) -> {MODEL_PATH}")
         else:
             patience_ctr += 1
             if patience_ctr >= early_stop_patience:
