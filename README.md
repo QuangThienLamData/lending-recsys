@@ -218,3 +218,22 @@ Access via the sidebar → **🔒 Internal Staff Dashboard** (credentials: `admi
 Tracks per-query: Identity ID, applicant name, requested amount, purpose, repayment
 score, and approval outcome. Dashboard charts include query volume over time, purpose
 breakdown, average repayment score by purpose, and overall acceptance rate.
+
+## 🧪 Testing the Application
+
+To verify the system's logic (Approval Prediction vs. Recommendations), you can use the following test cases in the **Loan Application** tab:
+
+### 1. High Repayment Profile (Expected Result: APPROVED)
+- **Identity ID**: `100001137`
+- **Typical Input**: $10,000 | 36 Months | Debt Consolidation
+- **Outcome**: This user has a high FICO and low DTI, resulting in a safe approval score.
+
+### 2. High Risk Profiles (Expected Result: NOT APPROVED + AI Recommendations)
+- **Identity ID**: `110727087` or `68499271`
+- **Test Input**: $40,000 | 60 Months | Other
+- **Outcome**: These IDs simulate profiles with lower repayment probabilities. The system will reject the $40,000 request but will immediately show **customized recommendation packages** that they *can* safely afford.
+
+### 3. AI Personal Recommender (AI Prompt Mode)
+Enable the **"Use AI Personal Loaning Recommendation"** checkbox and try a natural language prompt:
+- **Sample Prompt**: *"I want to buy a car with price $20,000 but now I only have $10,000, which loaning package is the most suitable"*
+- **Outcome**: The LLM will deduce the "Car" purpose, calculate the $10,000 gap, and prioritize Auto-loan products in the final ranking.
