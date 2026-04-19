@@ -55,6 +55,9 @@ Borrower Input (Identity ID + Loan Request)
                     ALS Retrieval ← FAISS top-50 candidates
                           │
                           ▼
+            Repayment Filter (≥65%) ← remove risky products
+                          │
+                          ▼
                     DeepFM Ranking ← top-10 candidates
                           │
                           ▼
@@ -69,11 +72,13 @@ Borrower Input (Identity ID + Loan Request)
                Internal Staff Dashboard (CSV log)
 ```
 
-### Stage 1 — Retrieval (ALS + FAISS)
+### Stage 1 — Retrieval (ALS + FAISS + Filter)
 ALS factorises the implicit user×item interaction matrix into 64-dimensional embeddings.
-Vectors are L2-normalised and indexed with `faiss.IndexFlatIP` for fast cosine similarity
-retrieval. The item catalog consists of **~181 synthetic loan product configurations**
-defined as unique **(Grade, Purpose, Term)** tuples.
+Vectors are L2-normalised and indexed with `faiss.IndexFlatIP` for fast similarity
+retrieval. **New Enhancement:** Immediately after retrieval, candidates are passed 
+through the calibrated XGBoost repay predictor; only products with a **≥65% 
+repayment probability** are passed to the ranking model. This ensures the recommendation
+funnel is "safety-first".
 
 ### Stage 2 — Ranking (DeepFM)
 A DeepFM model re-scores the FAISS candidate pool by jointly modelling second-order
