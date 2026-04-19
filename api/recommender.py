@@ -183,6 +183,44 @@ def run_recommendation_pipeline(request, artefacts: dict) -> dict:
         _, I = faiss_index.search(user_vec, pool)
         candidate_idxs = I[0]
 
+    # ── Step 2b: Filter candidates by repayment rate ≥ 65% ──────────────
+    # Run the XGBoost repay predictor (with calibrator) on all retrieved candidates
+    # and keep only those whose estimated repayment probability meets the threshold.
+    # For warm-start users we have user_idx; for cold-start we use cold_user_feats.
+    # If neither is available, fall back to the historical positive_rate on the catalog.
+    if predictor.repay_predictor is not None:
+        if not is_cold_start:
+            pre_repay = predictor.repay_predictor.predict(
+                np.array([user_idx] * len(candidate_idxs)), candidate_idxs
+            )
+        elif cold_user_feats is not None:
+            pre_repay = predictor.repay_predictor.predict_from_features(
+                cold_user_feats, candidate_idxs
+            )
+        else:
+            pre_repay = np.ones(len(candidate_idxs), dtype=np.float32)
+
+        pass_mask      = pre_repay >= APPROVAL_THRESHOLD
+        n_before       = len(candidate_idxs)
+        candidate_idxs = candidate_idxs[pass_mask]
+        logger.info(
+            "  Retrieval filter: %d / %d candidates pass repay ≥ %.0f%%",
+            len(candidate_idxs), n_before, APPROVAL_THRESHOLD * 100
+        )
+        if len(candidate_idxs) == 0:
+            # Safety: if nothing passes, fall back to all candidates rather than
+            # returning an empty recommendation list.
+            logger.warning("  All candidates below threshold — skipping repay filter.")
+            candidate_idxs = I[0] if not is_cold_start else _get_popular_items(item_lookup, pool)
+    else:
+        # No repay predictor loaded — filter using item catalog positive_rate
+        item_pos_rate = item_lookup.set_index("item_idx")["positive_rate"]
+        pass_mask = np.array([
+            item_pos_rate.get(int(idx), 0.0) >= APPROVAL_THRESHOLD
+            for idx in candidate_idxs
+        ])
+        candidate_idxs = candidate_idxs[pass_mask] if pass_mask.any() else candidate_idxs
+
     # ── Step 3: Ranking model ────────────────────────────────────────────
     if not is_cold_start:
         scores = predictor.score_candidates(user_idx, candidate_idxs)
@@ -226,17 +264,7 @@ def run_recommendation_pipeline(request, artefacts: dict) -> dict:
 
     candidates_df = pd.DataFrame(rows)
 
-    # ── Filter: keep only items with predicted repay probability ≥ 65% ──
-    # Use xgb_repay_prob when available; fall back to historical positive_rate
-    # for cold-start users with no XGBoost scores.
-    if len(candidates_df) > 0:
-        has_xgb = candidates_df["xgb_repay_prob"].gt(0).any()
-        repay_col = "xgb_repay_prob" if has_xgb else "positive_rate"
-        candidates_df = candidates_df[
-            candidates_df[repay_col] >= APPROVAL_THRESHOLD
-        ].reset_index(drop=True)
-        # Re-rank after filtering
-        candidates_df["rank"] = range(1, len(candidates_df) + 1)
+    # (filter already applied at retrieval stage above)
 
     # ── Step 5: Optional LLM rerank ─────────────────────────────────────
     if request.use_llm_rerank and not is_cold_start and len(candidates_df) > 0:
