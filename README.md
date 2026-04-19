@@ -219,7 +219,7 @@ Tracks per-query: Identity ID, applicant name, requested amount, purpose, repaym
 score, and approval outcome. Dashboard charts include query volume over time, purpose
 breakdown, average repayment score by purpose, and overall acceptance rate.
 
-## 🧪 Testing the Application
+## Testing the Application
 
 To verify the system's logic (Approval Prediction vs. Recommendations), you can use the following test cases in the **Loan Application** tab:
 
