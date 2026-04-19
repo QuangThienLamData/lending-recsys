@@ -225,12 +225,12 @@ To verify the system's logic (Approval Prediction vs. Recommendations), you can 
 
 ### 1. High Repayment Profile (Expected Result: APPROVED)
 - **Identity ID**: `100001137`
-- **Typical Input**: $10,000 | 36 Months | Debt Consolidation
+- **Typical Input**: $10,000 | 20.00% | 36 Months | Debt Consolidation
 - **Outcome**: This user has a high FICO and low DTI, resulting in a safe approval score.
 
 ### 2. High Risk Profiles (Expected Result: NOT APPROVED + AI Recommendations)
 - **Identity ID**: `110727087` or `68499271`
-- **Test Input**: $40,000 | 60 Months | Other
+- **Test Input**: $40,000 | 40.00% | 60 Months | Other
 - **Outcome**: These IDs simulate profiles with lower repayment probabilities. The system will reject the $40,000 request but will immediately show **customized recommendation packages** that they *can* safely afford.
 
 ### 3. AI Personal Recommender (AI Prompt Mode)
