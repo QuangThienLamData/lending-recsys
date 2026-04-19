@@ -1,0 +1,8 @@
+{
+  "user_feat_dim": 21,
+  "item_feat_dim": 25,
+  "n_users": 155656,
+  "n_items": 181,
+  "model_type": "neumf",
+  "repay_feat_dim": 1
+}
